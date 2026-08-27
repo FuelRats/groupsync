@@ -1,0 +1,520 @@
+/*
+ * groupsync - API-driven IRC Permission Sync for Anope 2.0
+ *
+ * Syncs channel access and vhosts from the Fuel Rats API.
+ * On user login, fetches permissions via HTTP and sets channel
+ * modes and vhost accordingly. No persistent state in Anope DB.
+ *
+ * Hooks into Anope's privilege system via OnGroupCheckPriv so
+ * that ChanServ commands (INVITE, KICK, BAN, etc.) work for
+ * users with API-granted permissions without needing ChanServ
+ * access list entries.
+ *
+ * Configuration (in modules.conf):
+ *   module { name = "groupsync"
+ *            apiurl = "https://api.fuelrats.com/anope"
+ *            apitoken = "your-bearer-token" }
+ *
+ * NickServ command mapping (in nickserv.conf):
+ *   command { service = "NickServ"; name = "GROUPSYNC"
+ *             command = "nickserv/groupsync" }
+ *
+ * Copyright 2026 The Fuel Rats Mischief
+ * Author: Alex Sørlie
+ */
+
+/* RequiredLibraries: curl,jansson */
+
+#include "module.h"
+#include <curl/curl.h>
+#include <jansson.h>
+#include <map>
+
+/* Per-user cached permissions */
+struct UserPerms
+{
+	Anope::string vhost;
+	/* channel name -> mode chars (e.g. "ohv") */
+	std::map<Anope::string, Anope::string> channels;
+};
+
+/* CURL write callback */
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+	size_t total = size * nmemb;
+	static_cast<Anope::string *>(userp)->append(static_cast<char *>(contents), total);
+	return total;
+}
+
+/*
+ * Map mode char to the Anope privilege rank it corresponds to.
+ * Users get all ChanServ privileges with rank <= their highest mode's rank.
+ *
+ * From chanserv.conf privilege definitions:
+ *   v = VOICE (rank 70)
+ *   h = HALFOP (rank 120)
+ *   o = OP (rank 230)
+ *   a = PROTECT (rank 310)
+ *   q = OWNER (rank 350)
+ */
+static int ModeCharToRank(char c)
+{
+	switch (c)
+	{
+		case 'v': return 70;
+		case 'h': return 120;
+		case 'o': return 230;
+		case 'a': return 310;
+		case 'q': return 350;
+		default: return 0;
+	}
+}
+
+/* Get the highest privilege rank from a mode string */
+static int HighestRank(const Anope::string &modes)
+{
+	int highest = 0;
+	for (unsigned i = 0; i < modes.length(); ++i)
+	{
+		int rank = ModeCharToRank(modes[i]);
+		if (rank > highest)
+			highest = rank;
+	}
+	return highest;
+}
+
+/* Map single mode char to Anope mode name */
+static Anope::string ModeCharToName(char c)
+{
+	switch (c)
+	{
+		case 'q': return "OWNER";
+		case 'a': return "PROTECT";
+		case 'o': return "OP";
+		case 'h': return "HALFOP";
+		case 'v': return "VOICE";
+		default: return "";
+	}
+}
+
+/* Forward declaration */
+class GroupSyncModule;
+
+/* NickServ GROUPSYNC command */
+class CommandNSGroupSync : public Command
+{
+public:
+	CommandNSGroupSync(Module *creator) : Command(creator, "nickserv/groupsync", 1, 1)
+	{
+		this->SetDesc(_("Re-sync IRC permissions from the API"));
+		this->SetSyntax(_("\037email\037"));
+	}
+
+	void Execute(CommandSource &source, const std::vector<Anope::string> &params) anope_override;
+
+	bool OnHelp(CommandSource &source, const Anope::string &subcommand) anope_override
+	{
+		source.Reply(_("Re-syncs IRC channel permissions and vhost from the API\n"
+			"for all online users identified with the given email.\n"
+			"This is typically triggered automatically by the bot."));
+		return true;
+	}
+};
+
+/* Timer for batched uplink sync to avoid blocking */
+class UplinkSyncTimer : public Timer
+{
+	GroupSyncModule *module;
+	std::vector<User *> pending;
+	unsigned batch_pos;
+
+public:
+	UplinkSyncTimer(GroupSyncModule *mod, const std::vector<User *> &users)
+		: Timer(1, Anope::CurTime, true), module(mod), pending(users), batch_pos(0)
+	{
+	}
+
+	void Tick(time_t) anope_override;
+};
+
+class GroupSyncModule : public Module
+{
+	/* In-memory permission cache: NickServ account -> permissions */
+	std::map<Anope::string, UserPerms> cache;
+
+	/* Config */
+	Anope::string api_url;
+	Anope::string api_token;
+
+	/* NickServ command */
+	CommandNSGroupSync commandgroupsync;
+
+	/* Active uplink sync timer (if any) */
+	UplinkSyncTimer *sync_timer;
+
+	/* Fetch permissions from API for a given email */
+	bool FetchPermissions(const Anope::string &email, UserPerms &perms)
+	{
+		if (api_url.empty() || api_token.empty())
+		{
+			Log(LOG_DEBUG) << "groupsync: API URL or token not configured";
+			return false;
+		}
+
+		CURL *curl = curl_easy_init();
+		if (!curl)
+			return false;
+
+		char *encoded_email = curl_easy_escape(curl, email.c_str(), email.length());
+		Anope::string url = api_url + "?email=" + encoded_email;
+		curl_free(encoded_email);
+
+		Anope::string response;
+		struct curl_slist *headers = NULL;
+		Anope::string auth_header = "Authorization: Bearer " + api_token;
+		headers = curl_slist_append(headers, auth_header.c_str());
+		headers = curl_slist_append(headers, "Accept: application/json");
+
+		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+		CURLcode res = curl_easy_perform(curl);
+		long http_code = 0;
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+		curl_slist_free_all(headers);
+		curl_easy_cleanup(curl);
+
+		if (res != CURLE_OK)
+		{
+			Log(LOG_NORMAL) << "groupsync: API request failed for " << email << ": " << curl_easy_strerror(res);
+			return false;
+		}
+
+		if (http_code != 200)
+		{
+			Log(LOG_NORMAL) << "groupsync: API returned HTTP " << http_code << " for " << email;
+			return false;
+		}
+
+		json_error_t error;
+		json_t *root = json_loads(response.c_str(), 0, &error);
+		if (!root)
+		{
+			Log(LOG_NORMAL) << "groupsync: JSON parse error for " << email << ": " << error.text;
+			return false;
+		}
+
+		json_t *j_vhost = json_object_get(root, "vhost");
+		if (j_vhost && json_is_string(j_vhost))
+			perms.vhost = json_string_value(j_vhost);
+
+		json_t *j_channels = json_object_get(root, "channels");
+		if (j_channels && json_is_object(j_channels))
+		{
+			const char *key;
+			json_t *value;
+			json_object_foreach(j_channels, key, value)
+			{
+				if (json_is_string(value))
+					perms.channels[key] = json_string_value(value);
+			}
+		}
+
+		json_decref(root);
+		return true;
+	}
+
+	/* Set specific modes for a user in a channel, removing any managed
+	 * modes that are no longer in the new mode string */
+	void SetModes(User *u, Channel *c, const Anope::string &new_modes)
+	{
+		if (!c || !u || !c->FindUser(u))
+			return;
+
+		BotInfo *chanserv = BotInfo::Find("ChanServ", true);
+		if (!chanserv)
+			return;
+
+		static const char managed[] = {'q', 'a', 'o', 'h', 'v'};
+
+		/* Remove modes no longer granted */
+		for (unsigned i = 0; i < sizeof(managed); ++i)
+		{
+			char mc = managed[i];
+			Anope::string mode_name = ModeCharToName(mc);
+			if (mode_name.empty())
+				continue;
+
+			bool should_have = (new_modes.find(mc) != Anope::string::npos);
+			if (!should_have && c->HasUserStatus(u, mode_name))
+				c->RemoveMode(chanserv, mode_name, u->GetUID());
+		}
+
+		/* Add modes that should be set */
+		for (unsigned i = 0; i < new_modes.length(); ++i)
+		{
+			Anope::string mode_name = ModeCharToName(new_modes[i]);
+			if (mode_name.empty())
+				continue;
+
+			if (!c->HasUserStatus(u, mode_name))
+				c->SetMode(chanserv, mode_name, u->GetUID());
+		}
+	}
+
+	/* Remove all managed modes from a user in a channel */
+	void RemoveModes(User *u, Channel *c)
+	{
+		SetModes(u, c, "");
+	}
+
+	void LoadConfig()
+	{
+		Configuration::Block *block = Config->GetModule(this);
+		if (block)
+		{
+			api_url = block->Get<const Anope::string>("apiurl", "");
+			api_token = block->Get<const Anope::string>("apitoken", "");
+		}
+	}
+
+public:
+	GroupSyncModule(const Anope::string &modname, const Anope::string &creator)
+		: Module(modname, creator, THIRD), commandgroupsync(this), sync_timer(NULL)
+	{
+		curl_global_init(CURL_GLOBAL_DEFAULT);
+		LoadConfig();
+	}
+
+	~GroupSyncModule()
+	{
+		curl_global_cleanup();
+	}
+
+	/* Full sync: apply vhost, modes, and invites for a user */
+	void SyncUser(User *u)
+	{
+		const NickCore *nc = u->Account();
+		if (!nc)
+			return;
+
+		UserPerms perms;
+		if (!FetchPermissions(nc->email, perms))
+			return;
+
+		/* Get old permissions for diffing */
+		std::map<Anope::string, UserPerms>::iterator old_it = cache.find(nc->display);
+		bool had_cache = (old_it != cache.end());
+		UserPerms old_perms;
+		if (had_cache)
+			old_perms = old_it->second;
+
+		/* Update cache */
+		cache[nc->display] = perms;
+
+		/* Set vhost */
+		if (!perms.vhost.empty())
+			IRCD->SendVhost(u, u->GetIdent(), perms.vhost);
+
+		/* Remove modes from channels the user lost access to entirely */
+		if (had_cache)
+		{
+			for (std::map<Anope::string, Anope::string>::iterator it = old_perms.channels.begin();
+				it != old_perms.channels.end(); ++it)
+			{
+				if (perms.channels.find(it->first) == perms.channels.end())
+				{
+					Channel *c = Channel::Find(it->first);
+					if (c)
+						RemoveModes(u, c);
+				}
+			}
+		}
+
+		/* Set/update modes in channels user is already in */
+		for (User::ChanUserList::const_iterator it = u->chans.begin(); it != u->chans.end(); ++it)
+		{
+			Channel *c = it->second->chan;
+			std::map<Anope::string, Anope::string>::iterator pit = perms.channels.find(c->name);
+			if (pit != perms.channels.end())
+				SetModes(u, c, pit->second);
+			else if (had_cache && old_perms.channels.find(c->name) != old_perms.channels.end())
+				RemoveModes(u, c);
+		}
+
+		/* Invite to +i channels the user has access to but isn't in */
+		for (std::map<Anope::string, Anope::string>::iterator it = perms.channels.begin();
+			it != perms.channels.end(); ++it)
+		{
+			Channel *c = Channel::Find(it->first);
+			if (!c)
+				continue;
+
+			if (c->HasMode("INVITE") && !c->FindUser(u))
+			{
+				ChannelInfo *ci = c->ci;
+				if (ci)
+					IRCD->SendInvite(ci->WhoSends(), c, u);
+			}
+		}
+
+		Log(LOG_DEBUG) << "groupsync: Synced " << nc->display << " (" << nc->email << "): "
+			<< perms.channels.size() << " channels, vhost=" << perms.vhost;
+	}
+
+	void OnReload(Configuration::Conf *conf) anope_override
+	{
+		LoadConfig();
+	}
+
+	void OnUserLogin(User *u) anope_override
+	{
+		SyncUser(u);
+	}
+
+	void OnJoinChannel(User *u, Channel *c) anope_override
+	{
+		const NickCore *nc = u->Account();
+		if (!nc)
+			return;
+
+		std::map<Anope::string, UserPerms>::iterator cit = cache.find(nc->display);
+		if (cit == cache.end())
+			return;
+
+		std::map<Anope::string, Anope::string>::iterator pit = cit->second.channels.find(c->name);
+		if (pit != cit->second.channels.end())
+			SetModes(u, c, pit->second);
+	}
+
+	void OnNickLogout(User *u) anope_override
+	{
+		const NickCore *nc = u->Account();
+		if (!nc)
+			return;
+
+		std::map<Anope::string, UserPerms>::iterator cit = cache.find(nc->display);
+		if (cit != cache.end())
+		{
+			for (User::ChanUserList::const_iterator it = u->chans.begin(); it != u->chans.end(); ++it)
+			{
+				Channel *c = it->second->chan;
+				if (cit->second.channels.find(c->name) != cit->second.channels.end())
+					RemoveModes(u, c);
+			}
+			cache.erase(nc->display);
+		}
+	}
+
+	void OnUserQuit(User *u, const Anope::string &msg) anope_override
+	{
+		const NickCore *nc = u->Account();
+		if (nc)
+			cache.erase(nc->display);
+	}
+
+	void OnUplinkSync(Server *s) anope_override
+	{
+		/* Collect identified users and sync them in batches via timer
+		 * to avoid blocking the main thread with hundreds of HTTP calls */
+		std::vector<User *> users;
+		for (user_map::const_iterator it = UserListByNick.begin(); it != UserListByNick.end(); ++it)
+		{
+			if (it->second->Account())
+				users.push_back(it->second);
+		}
+
+		if (users.empty())
+			return;
+
+		Log(LOG_NORMAL) << "groupsync: Uplink sync, queuing " << users.size() << " users for re-sync";
+		sync_timer = new UplinkSyncTimer(this, users);
+	}
+
+	EventReturn OnGroupCheckPriv(const AccessGroup *group, const Anope::string &priv) anope_override
+	{
+		if (!group->nc || !group->ci)
+			return EVENT_CONTINUE;
+
+		std::map<Anope::string, UserPerms>::iterator cit = cache.find(group->nc->display);
+		if (cit == cache.end())
+			return EVENT_CONTINUE;
+
+		std::map<Anope::string, Anope::string>::iterator pit = cit->second.channels.find(group->ci->name);
+		if (pit == cit->second.channels.end())
+			return EVENT_CONTINUE;
+
+		int user_rank = HighestRank(pit->second);
+
+		/* Access-only (no modes): grant INVITE so users can rejoin +i channels */
+		if (user_rank == 0)
+		{
+			if (priv == "INVITE")
+				return EVENT_ALLOW;
+			return EVENT_CONTINUE;
+		}
+
+		Privilege *p = PrivilegeManager::FindPrivilege(priv);
+		if (p && p->rank <= user_rank)
+			return EVENT_ALLOW;
+
+		return EVENT_CONTINUE;
+	}
+};
+
+/* Timer tick: sync a batch of users per tick */
+void UplinkSyncTimer::Tick(time_t)
+{
+	const unsigned BATCH_SIZE = 5;
+
+	for (unsigned i = 0; i < BATCH_SIZE && batch_pos < pending.size(); ++i, ++batch_pos)
+	{
+		User *u = pending[batch_pos];
+		/* User may have quit since we queued them */
+		if (u && u->Account())
+			module->SyncUser(u);
+	}
+
+	if (batch_pos >= pending.size())
+	{
+		Log(LOG_NORMAL) << "groupsync: Uplink sync complete (" << pending.size() << " users)";
+		/* Timer auto-destructs when SetRepeat expires, but since we
+		 * used repeat=true, we need to stop it manually */
+		this->SetSecs(0);
+	}
+}
+
+/* Command implementation */
+void CommandNSGroupSync::Execute(CommandSource &source, const std::vector<Anope::string> &params)
+{
+	if (!source.IsOper())
+	{
+		source.Reply(_("Permission denied."));
+		return;
+	}
+
+	const Anope::string &email = params[0];
+	GroupSyncModule *mod = static_cast<GroupSyncModule *>(this->module);
+
+	bool found = false;
+	for (user_map::const_iterator it = UserListByNick.begin(); it != UserListByNick.end(); ++it)
+	{
+		User *u = it->second;
+		const NickCore *nc = u->Account();
+		if (nc && nc->email.equals_ci(email))
+		{
+			mod->SyncUser(u);
+			source.Reply(_("Synced permissions for %s (%s)."), u->nick.c_str(), nc->display.c_str());
+			found = true;
+		}
+	}
+
+	if (!found)
+		source.Reply(_("No online identified user found with email %s."), email.c_str());
+}
+
+MODULE_INIT(GroupSyncModule)
