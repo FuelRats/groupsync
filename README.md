@@ -43,3 +43,22 @@ drop the `anope.read` bearer into the `apitokenfile` path (0600), rebuild the im
 **Dev loop (stilton):** build ctx `~/anope-2.1-build` (Dockerfile clones 2.1.26, `COPY`s third
 modules), config bind-mounted at `~/anope-2.1-build/testconf/conf/`, container `anope-2_1-dev`.
 Rebuild + restart to test; watch `testconf/logs/services.log.*`.
+
+## Add-on B — `m_rolesync` (UnrealIRCd module)
+
+`m_rolesync.c` is a companion **UnrealIRCd** module (build into the IRCd, not Anope). It lets
+role-holders into invite-only (`+i`) channels without a stored invite — the join-time equivalent
+of the channel-mode grants above.
+
+With `rolesync = yes` set in the groupsync Anope module block, the Anope side emits an `fr_gated`
+client ModData listing each user's authorised `+i` channels (via S2S `MD`). On `PRE_LOCAL_JOIN`,
+`m_rolesync` grants the join (bypassing `+i`/`+k`/`+l`) iff the channel is `+i`, the user's
+`fr_gated` set contains it, and the preserved restrictions hold (`+b`/`+e` ban, `+z` secure,
+`+O` oper). It is additive-only — it never denies a join — and registers ahead of
+`m_autoban`/`m_fruser`. Build for the target UnrealIRCd version:
+
+```sh
+cp m_rolesync.c <unrealircd-src>/src/modules/third/
+cd <unrealircd-src> && make custommodule MODULEFILE=m_rolesync
+# then: loadmodule "third/m_rolesync"; in unrealircd.conf on every server
+```
