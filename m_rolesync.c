@@ -22,12 +22,22 @@
  * (Risk 62/63): without the callbacks cmd_md silently drops the inbound MD from
  * services; without remote_write the leaf rejects services' write to a local
  * client's moddata. Build into BOTH IRC images (hub native + leaf container).
+ *
+ * Fetch/join race (Add-on B): the Anope groupsync module fetches access on a
+ * background thread, so `fr_gated` is set a moment AFTER login. A client that
+ * auto-joins a +i channel at connect can beat it — the join is denied by +i
+ * before `fr_gated` exists, and nothing re-joins them when it arrives. To close
+ * this, when we decline a +i join *only because `fr_gated` isn't set yet*, we
+ * remember the attempt and, once `fr_gated` shows up (polled on a short timer),
+ * re-drive the JOIN through the normal path (which re-enters this hook and now
+ * authorises it). A set-but-excluding `fr_gated` is a genuine deny — not
+ * remembered.
  */
 #include "unrealircd.h"
 
 ModuleHeader MOD_HEADER = {
     "third/m_rolesync",
-    "1.0",
+    "1.1",
     "groupsync join interception for +i channels (fr_gated)",
     "fuelrats",
     "unrealircd-6",
@@ -35,6 +45,28 @@ ModuleHeader MOD_HEADER = {
 
 /* Run ahead of m_autoban/m_fruser (priority 0): lower value = called first. */
 #define ROLESYNC_JOIN_PRIO (-1000000)
+
+/* Deferred-join retry: poll cadence, how long to keep retrying, and a cap so a
+ * client spamming +i joins can't grow the list without bound. */
+#define ROLESYNC_RETRY_MSEC 400
+#define ROLESYNC_PENDING_TTL 6
+#define ROLESYNC_PENDING_MAX 512
+/* Generous fixed bound for a channel name (UnrealIRCd has no public
+ * CHANNELLEN); strlcpy truncates safely regardless. */
+#define ROLESYNC_CHANNAMELEN 256
+
+/* A +i join we declined only because fr_gated hadn't synced yet. Keyed by UID
+ * (re-resolved each tick, so a quit client's entry simply drops). */
+typedef struct RolesyncPending {
+  char uid[IDLEN + 1];
+  char channel[ROLESYNC_CHANNAMELEN];
+  time_t expires;
+  struct RolesyncPending *next;
+} RolesyncPending;
+
+static RolesyncPending *rolesync_pending = NULL;
+static int rolesync_pending_count = 0;
+static Event *rolesync_retry_event = NULL;
 
 static ModDataInfo *rolesync_md = NULL;
 
@@ -67,6 +99,75 @@ static int rolesync_authorized(Client *client, const char *channame) {
   return 0;
 }
 
+/* Remember a +i join declined only because fr_gated hadn't synced yet, so the
+ * retry timer can re-drive it once fr_gated arrives. Idempotent per
+ * uid+channel; refuses to grow past the cap. */
+static void rolesync_remember(Client *client, const char *channame) {
+  RolesyncPending *p;
+
+  for (p = rolesync_pending; p; p = p->next) {
+    if (!strcmp(p->uid, client->id) && !strcasecmp(p->channel, channame)) {
+      p->expires = TStime() + ROLESYNC_PENDING_TTL;
+      return;
+    }
+  }
+
+  if (rolesync_pending_count >= ROLESYNC_PENDING_MAX)
+    return;
+
+  p = safe_alloc(sizeof(RolesyncPending));
+  strlcpy(p->uid, client->id, sizeof(p->uid));
+  strlcpy(p->channel, channame, sizeof(p->channel));
+  p->expires = TStime() + ROLESYNC_PENDING_TTL;
+  p->next = rolesync_pending;
+  rolesync_pending = p;
+  rolesync_pending_count++;
+}
+
+/* Poll pending deferred joins. For each: drop if the client is gone or the TTL
+ * lapsed; once fr_gated has arrived, decide once — re-drive the JOIN if it now
+ * authorises the channel, then drop either way. A JOIN re-enters
+ * rolesync_prejoin (fr_gated now set), which re-checks the preserved
+ * restrictions before allowing. */
+static EVENT(rolesync_retry_ev) {
+  time_t now = TStime();
+  RolesyncPending **pp = &rolesync_pending;
+
+  while (*pp) {
+    RolesyncPending *p = *pp;
+    int drop = 0;
+    Client *client = find_client(p->uid, NULL);
+
+    if (!client || !MyUser(client) || now > p->expires) {
+      drop = 1;
+    } else {
+      const char *gated = moddata_client_get(client, "fr_gated");
+      if (!BadPtr(gated)) {
+        Channel *channel = find_channel(p->channel);
+        if (channel && has_channel_mode(channel, 'i') &&
+            !IsMember(client, channel) &&
+            rolesync_authorized(client, channel->name)) {
+          const char *parv[3];
+          parv[0] = client->name;
+          parv[1] = channel->name;
+          parv[2] = NULL;
+          do_cmd(client, NULL, "JOIN", 2, parv);
+        }
+        drop = 1; /* fr_gated present → resolved; stop retrying */
+      }
+      /* else: fr_gated still absent → keep waiting until expiry */
+    }
+
+    if (drop) {
+      *pp = p->next;
+      rolesync_pending_count--;
+      safe_free(p);
+    } else {
+      pp = &p->next;
+    }
+  }
+}
+
 /*
  * PRE_LOCAL_JOIN: grant an authorised role-holder entry to a +i channel,
  * preserving bans / secure-only / oper-only. Additive only — never denies.
@@ -76,6 +177,15 @@ static int rolesync_prejoin(Client *client, Channel *channel, const char *key) {
    * already decides correctly. */
   if (!has_channel_mode(channel, 'i'))
     return HOOK_CONTINUE;
+
+  /* If fr_gated hasn't synced yet, this is likely the login-fetch race: let +i
+   * decline for now, but remember so the retry timer re-drives the join once
+   * fr_gated arrives. A present-but-excluding fr_gated is a genuine deny below.
+   */
+  if (BadPtr(moddata_client_get(client, "fr_gated"))) {
+    rolesync_remember(client, channel->name);
+    return HOOK_CONTINUE;
+  }
 
   /* Only intervene for a user whose roles authorise THIS channel. */
   if (!rolesync_authorized(client, channel->name))
@@ -120,8 +230,27 @@ MOD_INIT() {
 
   HookAdd(modinfo->handle, HOOKTYPE_PRE_LOCAL_JOIN, ROLESYNC_JOIN_PRIO,
           rolesync_prejoin);
+
+  rolesync_retry_event =
+      EventAdd(modinfo->handle, "rolesync_retry", rolesync_retry_ev, NULL,
+               ROLESYNC_RETRY_MSEC, 0);
   return MOD_SUCCESS;
 }
 
 MOD_LOAD() { return MOD_SUCCESS; }
-MOD_UNLOAD() { return MOD_SUCCESS; }
+
+MOD_UNLOAD() {
+  RolesyncPending *p, *next;
+
+  if (rolesync_retry_event) {
+    EventDel(rolesync_retry_event);
+    rolesync_retry_event = NULL;
+  }
+  for (p = rolesync_pending; p; p = next) {
+    next = p->next;
+    safe_free(p);
+  }
+  rolesync_pending = NULL;
+  rolesync_pending_count = 0;
+  return MOD_SUCCESS;
+}
