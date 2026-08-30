@@ -102,6 +102,15 @@ struct FetchRequest final {
   uint64_t accountId = 0; // NickCore::GetId() handle for applying; 0 if unknown
 };
 
+// One role from the API. `hidden` roles (opers Anope already whois-tags, and
+// the internal service group) are still delivered so the module can RETRACT any
+// stale SWHOIS line for them; they are never set.
+struct RoleTag final {
+  std::string name;    // group machine name → SWHOIS line tag "fr-role:<name>"
+  std::string display; // the whois text (ignored when hidden)
+  bool hidden = false;
+};
+
 struct FetchResult final {
   std::string email;
   uint64_t accountId = 0;
@@ -110,8 +119,7 @@ struct FetchResult final {
   long httpError = 0; // -1 curl error, else HTTP status when ok == false
   unsigned droppedFlags = 0;
   ChannelPrivs channels; // empty (with ok == true) means "no access" → revoke
-  std::vector<std::pair<std::string, std::string>>
-      roles; // (group name → display); rendered as SWHOIS lines (Add-on A)
+  std::vector<RoleTag> roles; // rendered as SWHOIS lines (Add-on A)
 };
 
 size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata) {
@@ -224,12 +232,14 @@ private:
           continue;
         json_t *name = json_object_get(entry, "name");
         json_t *display = json_object_get(entry, "display");
+        json_t *hidden = json_object_get(entry, "hidden");
         if (!json_is_string(name))
           continue;
         std::string tagName = json_string_value(name);
         std::string text =
             json_is_string(display) ? json_string_value(display) : tagName;
-        res.roles.emplace_back(std::move(tagName), std::move(text));
+        res.roles.emplace_back(
+            RoleTag{std::move(tagName), std::move(text), json_is_true(hidden)});
       }
     }
 
@@ -411,17 +421,22 @@ private:
 
   /* Render the account's roles as tagged SWHOIS lines on each online session
    * (Add-on A). Diffs against the tags we last set for this account so a
-   * removed role's line is withdrawn; re-adding a still-present line is
-   * idempotent. UnrealIRCd clears SWHOIS on quit, so after a module reload
-   * stale lines self-heal on the user's next reconnect or role change. */
-  void
-  ApplySwhois(const std::string &email,
-              const std::vector<std::pair<std::string, std::string>> &roles,
-              NickCore *nc) {
+   * removed role's line is withdrawn. Every tag is DELETED before it is set:
+   * `SendSWhois` appends rather than replacing, so a plain re-apply would stack
+   * duplicate lines — delete-before-set collapses any stale/duplicate copies to
+   * exactly one, and hidden roles are deleted without being re-set. */
+  void ApplySwhois(const std::string &email, const std::vector<RoleTag> &roles,
+                   NickCore *nc) {
     std::string key = ToLower(email);
-    std::set<std::string> newTags;
-    for (const auto &role : roles)
-      newTags.insert("fr-role:" + role.first);
+    std::set<std::string>
+        payloadTags;               // every tag in this payload (shown+hidden)
+    std::set<std::string> newTags; // shown tags only → next diff baseline
+    for (const auto &role : roles) {
+      std::string tag = "fr-role:" + role.name;
+      payloadTags.insert(tag);
+      if (!role.hidden)
+        newTags.insert(tag);
+    }
 
     std::set<std::string> oldTags;
     {
@@ -433,12 +448,19 @@ private:
 
     MessageSource source(Me);
     for (auto *u : nc->users) {
+      // Retract tags we previously set that this payload no longer mentions
+      // (role fully removed from the user).
       for (const auto &tag : oldTags)
-        if (!newTags.count(tag))
+        if (!payloadTags.count(tag))
           IRCD->SendSWhoisDel(source, u, tag, "");
-      for (const auto &role : roles)
-        IRCD->SendSWhois(source, u, "fr-role:" + role.first, Anope::CurTime,
-                         role.second);
+      // Delete-then-set every payload tag: clears duplicate/stale lines and
+      // drops hidden (oper/service) roles; sets each shown role exactly once.
+      for (const auto &role : roles) {
+        std::string tag = "fr-role:" + role.name;
+        IRCD->SendSWhoisDel(source, u, tag, "");
+        if (!role.hidden)
+          IRCD->SendSWhois(source, u, tag, Anope::CurTime, role.display);
+      }
     }
 
     {
