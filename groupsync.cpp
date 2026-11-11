@@ -9,8 +9,12 @@
  * status modes durably (the direct-mode-set path is not durable —
  * SetCorrectModes strips modes from users lacking the privilege).
  *
- * Out of scope: authentication (the API keeps mirroring bcrypt + cert into
- * NickCore) and vhosts (HostServ). This module sends neither.
+ * It also accepts one-time SASL token logins: a SASL PLAIN password of the form
+ * `frk1:<ts>:<hex HMAC-SHA256(secret, "<account>|<ts>")>`, minted by the API
+ * with the secret in `sasltoken_secretfile` (see OnCheckAuthentication).
+ *
+ * Out of scope: other authentication (the API keeps mirroring bcrypt + cert
+ * into NickCore) and vhosts (HostServ). This module sends neither.
  *
  * Built against the Anope 2.1.26 module API. See README.md + the api repo
  * thoughts/plans/groupsync-implementation.md for the full design.
@@ -27,10 +31,12 @@
 /// END CMAKE
 
 #include "module.h"
+#include "modules/encryption.h"
 
 #include <curl/curl.h>
 #include <jansson.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -41,6 +47,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -49,6 +56,19 @@ namespace {
 const size_t QUEUE_CAP = 256;
 /* Default per-request API timeout in seconds. */
 const long DEFAULT_TIMEOUT = 5;
+
+/* SASL token login: the password prefix that marks a token. */
+const std::string SASLTOKEN_PREFIX = "frk1:";
+/* Shortest secret accepted from `sasltoken_secretfile`. */
+const size_t SASLTOKEN_MIN_SECRET = 32;
+/* Default and maximum seconds a token is valid either side of its timestamp. */
+const time_t SASLTOKEN_MAX_AGE = 60;
+/* Longest timestamp accepted, in digits; keeps the parse inside time_t. */
+const size_t SASLTOKEN_MAX_TS_DIGITS = 18;
+/* Length of the lowercase hex HMAC-SHA256 that follows the timestamp. */
+const size_t SASLTOKEN_MAC_LENGTH = 64;
+/* A used MAC is remembered for this many token lifetimes (maxage). */
+const time_t SASLTOKEN_USED_LIFETIMES = 2;
 
 /* A user's cached channel access: lowercased channel name -> the set of
  * Anope privilege NAMES the group-configured FLAGS letters expand to. */
@@ -126,6 +146,43 @@ size_t WriteCallback(char *ptr, size_t size, size_t nmemb, void *userdata) {
   auto *buf = static_cast<std::string *>(userdata);
   buf->append(ptr, size * nmemb);
   return size * nmemb;
+}
+
+/* Compares two strings in time that depends only on their length. */
+bool SafeEquals(const std::string &a, const std::string &b) {
+  if (a.length() != b.length())
+    return false;
+  unsigned char diff = 0;
+  for (size_t i = 0; i < a.length(); ++i)
+    diff |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  return diff == 0;
+}
+
+/* Splits a `frk1:<ts>:<64 lowercase hex>` password into the timestamp text as
+ * sent, its value, and the MAC. False unless the password has exactly that
+ * shape. */
+bool ParseSaslToken(const std::string &password, std::string &tsText,
+                    time_t &ts, std::string &mac) {
+  size_t sep = password.find(':', SASLTOKEN_PREFIX.length());
+  if (sep == std::string::npos)
+    return false;
+  tsText = password.substr(SASLTOKEN_PREFIX.length(),
+                           sep - SASLTOKEN_PREFIX.length());
+  mac = password.substr(sep + 1);
+  if (tsText.empty() || tsText.length() > SASLTOKEN_MAX_TS_DIGITS ||
+      mac.length() != SASLTOKEN_MAC_LENGTH)
+    return false;
+
+  ts = 0;
+  for (char ch : tsText) {
+    if (!std::isdigit(static_cast<unsigned char>(ch)))
+      return false;
+    ts = ts * 10 + (ch - '0');
+  }
+  for (char ch : mac)
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')))
+      return false;
+  return true;
 }
 } // namespace
 
@@ -380,6 +437,14 @@ private:
   bool rolesyncEnabled =
       false; // emit fr_gated ModData for m_rolesync (Add-on B)
 
+  /* SASL token login (see OnCheckAuthentication). An empty secret means token
+   * login is off. Only touched on the main thread. */
+  ServiceReference<Encryption::Provider> sha256;
+  std::string sasltokenSecret;
+  time_t sasltokenMaxAge = SASLTOKEN_MAX_AGE;
+  std::unordered_map<std::string, time_t>
+      usedSaslTokens; // MAC -> time it logged in
+
   static bool curlInitialised;
 
   std::string ReadToken(const std::string &path) {
@@ -394,13 +459,53 @@ private:
     return token;
   }
 
-  void LoadConfig() {
-    auto &block = Config->GetModule(this);
+  /* Reads the module block. Runs from OnReload (module load and every rehash,
+   * against the incoming config) and from OnPostInit. */
+  void LoadConfig(Configuration::Conf &conf) {
+    auto &block = conf.GetModule(this);
     this->apiurl = block.Get<const Anope::string>("apiurl").str();
     this->tokenFile = block.Get<const Anope::string>("apitokenfile").str();
     int configured = block.Get<int>("apitimeout");
     this->timeout = configured > 0 ? configured : DEFAULT_TIMEOUT;
     this->rolesyncEnabled = block.Get<bool>("rolesync");
+    this->LoadSaslTokenConfig(block);
+  }
+
+  /* A missing or short secret turns token login off (logged) instead of
+   * failing the module, so channel sync keeps running. */
+  void LoadSaslTokenConfig(const Configuration::Block &block) {
+    time_t maxage = block.Get<time_t>("sasltoken_maxage");
+    this->sasltokenMaxAge =
+        maxage > 0 ? std::min(maxage, SASLTOKEN_MAX_AGE) : SASLTOKEN_MAX_AGE;
+
+    std::string secretFile =
+        block.Get<const Anope::string>("sasltoken_secretfile").str();
+    std::string secret = this->ReadToken(secretFile);
+    if (secretFile.empty()) {
+      Log(this) << "groupsync: no sasltoken_secretfile configured, SASL token "
+                   "login is off";
+    } else if (secret.length() < SASLTOKEN_MIN_SECRET) {
+      Log(this) << "groupsync: sasltoken_secretfile " << secretFile
+                << " is missing, unreadable or shorter than "
+                << SASLTOKEN_MIN_SECRET
+                << " characters, SASL token login is off";
+      secret.clear();
+    } else {
+      Log(this) << "groupsync: SASL token login is on (maxage "
+                << this->sasltokenMaxAge << "s)";
+    }
+    this->sasltokenSecret = secret;
+  }
+
+  void PruneUsedSaslTokens() {
+    for (auto it = this->usedSaslTokens.begin();
+         it != this->usedSaslTokens.end();) {
+      if (Anope::CurTime - it->second >
+          SASLTOKEN_USED_LIFETIMES * this->sasltokenMaxAge)
+        it = this->usedSaslTokens.erase(it);
+      else
+        ++it;
+    }
   }
 
   void ApplyChannel(Channel *c, User *u) {
@@ -546,7 +651,8 @@ private:
 
 public:
   GroupsyncModule(const Anope::string &modname, const Anope::string &creator)
-      : Module(modname, creator, THIRD), commandgroupsync(this, this) {
+      : Module(modname, creator, THIRD), commandgroupsync(this, this),
+        sha256("Encryption::Provider", "sha256") {
     if (!GroupsyncModule::curlInitialised) {
       curl_global_init(CURL_GLOBAL_DEFAULT);
       GroupsyncModule::curlInitialised = true;
@@ -632,7 +738,7 @@ public:
   /* --- events (plain overrides; auto-attached at load) --- */
 
   void OnPostInit() override {
-    this->LoadConfig();
+    this->LoadConfig(*Config);
     std::string token = this->ReadToken(this->tokenFile);
     if (this->apiurl.empty())
       Log(this) << "groupsync: no apiurl configured — module will not fetch";
@@ -642,12 +748,7 @@ public:
   }
 
   void OnReload(Configuration::Conf &conf) override {
-    auto &block = conf.GetModule(this);
-    this->apiurl = block.Get<const Anope::string>("apiurl").str();
-    this->tokenFile = block.Get<const Anope::string>("apitokenfile").str();
-    int configured = block.Get<int>("apitimeout");
-    this->timeout = configured > 0 ? configured : DEFAULT_TIMEOUT;
-    this->rolesyncEnabled = block.Get<bool>("rolesync");
+    this->LoadConfig(conf);
     if (this->worker)
       this->worker->UpdateConfig(this->apiurl, this->ReadToken(this->tokenFile),
                                  this->timeout);
@@ -713,6 +814,52 @@ public:
         continue;
       this->EnqueueByEmail(nc->email.str(), nc->GetId());
     }
+  }
+
+  /* SASL token login. Accepts a `frk1:<ts>:<hex HMAC-SHA256(secret,
+   * "<authcid>|<ts>")>` password once, within maxage of its timestamp, from
+   * SASL PLAIN only. Anything else is left alone, so the normal password checks
+   * fail it (904 for SASL) and badpasslimit applies. Runs on the main thread,
+   * which is the only one touching usedSaslTokens. */
+  void OnCheckAuthentication(User *, IdentifyRequest *req) override {
+    if (this->sasltokenSecret.empty() || !this->sha256)
+      return;
+    const std::string &password = req->GetPassword().str();
+    if (password.compare(0, SASLTOKEN_PREFIX.length(), SASLTOKEN_PREFIX) != 0)
+      return;
+    Module *plain = ModuleManager::FindModule("ns_sasl_plain");
+    if (!plain || req->GetOwner() != plain)
+      return;
+
+    std::string tsText;
+    time_t ts = 0;
+    std::string mac;
+    if (!ParseSaslToken(password, tsText, ts, mac))
+      return;
+
+    NickAlias *na = NickAlias::Find(req->GetAccount());
+    if (!na)
+      return;
+
+    time_t age = Anope::CurTime - ts;
+    if (age > this->sasltokenMaxAge || age < -this->sasltokenMaxAge)
+      return;
+
+    std::string expected =
+        Anope::Hex(this->sha256->HMAC(this->sasltokenSecret,
+                                      req->GetAccount() + "|" + tsText))
+            .str();
+    if (!SafeEquals(expected, mac))
+      return;
+
+    this->PruneUsedSaslTokens();
+    if (this->usedSaslTokens.count(mac))
+      return;
+    this->usedSaslTokens[mac] = Anope::CurTime;
+
+    Log(this) << "groupsync: SASL token login for " << na->nc->display
+              << " from " << req->GetAddress();
+    req->Success(this, na);
   }
 };
 
