@@ -3,7 +3,8 @@
 Makes [api.fuelrats.com](https://github.com/fuelrats/api.fuelrats.com) the source of truth for
 **IRC channel access** (ChanServ privileges/modes). On login the module pulls a user's per-channel
 role-derived flags from the API and authorizes them through ChanServ's privilege system
-(`OnGroupCheckPriv`), so modes are applied durably by ChanServ. Out of scope: authentication
+(`OnGroupCheckPriv`), so modes are applied durably by ChanServ. It also accepts one-time
+API-minted SASL token logins (see "SASL token login" below). Out of scope: other authentication
 (the API keeps mirroring `bcrypt:` + cert into NickCore) and vhosts (HostServ).
 
 This is a **fresh Anope 2.1.26 implementation**. The prior Anope 2.0 attempt is kept for design
@@ -43,6 +44,44 @@ drop the `anope.read` bearer into the `apitokenfile` path (0600), rebuild the im
 **Dev loop (stilton):** build ctx `~/anope-2.1-build` (Dockerfile clones 2.1.26, `COPY`s third
 modules), config bind-mounted at `~/anope-2.1-build/testconf/conf/`, container `anope-2_1-dev`.
 Rebuild + restart to test; watch `testconf/logs/services.log.*`.
+
+## SASL token login
+
+Lets a client log in to NickServ over SASL PLAIN with a one-time token instead of the account
+password (used by the rat Kiwi "Log in with Fuel Rats" flow). The API mints the token before each
+connect and returns it as the SASL password:
+
+```text
+frk1:<unix ts>:<lowercase hex HMAC-SHA256(secret, "<account>|<unix ts>")>
+```
+
+`<account>` is the SASL authcid exactly as the client sends it, and `<unix ts>` is the timestamp
+text exactly as it appears in the token. The key is the secret file's contents as ASCII.
+
+`OnCheckAuthentication` accepts the token only if all of these hold, and otherwise does nothing,
+so the normal password checks fail the login (904) and `badpasslimit` applies:
+
+- the password starts with `frk1:` and the request comes from `ns_sasl_plain` (NickServ
+  IDENTIFY, RECOVER, GROUP, RPC and webcpanel never accept a token);
+- the password is `frk1:<digits>:<64 lowercase hex>`;
+- the authcid is a registered nick (`NickAlias::Find`);
+- `|now - ts| <= sasltoken_maxage`;
+- the HMAC matches (constant-time compare);
+- the MAC has not logged in before (used MACs are kept for 2 x maxage).
+
+On success it logs `groupsync: SASL token login for <account> from <ip>`. `ns_sasl_plain` still
+refuses suspended and unconfirmed accounts and enforces `ns_identify:maxlogins`.
+
+Config (in the `groupsync` module block, see `groupsync.example.conf`):
+
+- `sasltoken_secretfile`: path to a 0600 file, readable by the Anope user, holding only the
+  secret (at least 32 characters). Unset means no token login. A missing, unreadable or short
+  file is logged and turns token login off; channel sync keeps running.
+- `sasltoken_maxage`: seconds either side of the timestamp, default 60, capped at 60.
+
+The keys are read at module load and on every rehash. The HMAC uses the `sha256` provider from
+`enc_sha2`, which must be loaded. Use a secret of its own (for example `openssl rand -hex 32`),
+not the Matrix bridge's `matrix_token` secret.
 
 ## Add-on B — `m_rolesync` (UnrealIRCd module)
 
